@@ -1,0 +1,556 @@
+---
+title: "Dashboard"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = 
+  "~"
+)
+```
+
+```{r}
+library(DatabaseConnector)
+library(CohortGenerator)
+library(tidyverse)
+library(lubridate)
+library(shiny)
+library(shinydashboard)
+library(DT)
+
+library(stringr)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+```
+
+
+```{r}
+connectionDetails <- createConnectionDetails(
+  dbms = "postgresql", 
+  server = paste0(Sys.getenv("DB_HOST"), "/maitt"),
+  user = Sys.getenv("DB_USERNAME"),
+  password = Sys.getenv("DB_PASSWORD"),
+  port = 65432
+)
+
+# ------------------ Generate Cohorts ------------------
+generateCohorts <- function() {
+  cohortsToCreate <- CohortGenerator::createEmptyCohortDefinitionSet()
+  cohortJsonFiles <- list.files(
+    path = "path to the CohortJSONs/", 
+    full.names = TRUE
+  )
+  
+  for (i in seq_along(cohortJsonFiles)) {
+    cohortJsonFileName <- cohortJsonFiles[i]
+    cohortName <- trimws(tools::file_path_sans_ext(basename(cohortJsonFileName)))
+    
+    cohortJson <- readChar(cohortJsonFileName, file.info(cohortJsonFileName)$size)
+    cohortExpression <- CirceR::cohortExpressionFromJson(cohortJson)
+    cohortSql <- CirceR::buildCohortQuery(
+      cohortExpression, 
+      options = CirceR::createGenerateOptions(generateStats = FALSE)
+    )
+    
+    cohortsToCreate <- rbind(
+      cohortsToCreate, 
+      data.frame(cohortId = i,
+                 cohortName = cohortName, 
+                 sql = cohortSql,
+                 stringsAsFactors = FALSE)
+    )
+  }
+  
+  cohortTableNames <- CohortGenerator::getCohortTableNames(cohortTable = "dashboard")
+  CohortGenerator::createCohortTables(
+    connectionDetails = connectionDetails,
+    cohortDatabaseSchema = "user_teele",
+    cohortTableNames = cohortTableNames
+  )
+  
+  CohortGenerator::generateCohortSet(
+    connectionDetails = connectionDetails,
+    cdmDatabaseSchema = "ohdsi_cdm_202501",
+    cohortDatabaseSchema = "user_teele",
+    cohortTableNames = cohortTableNames,
+    cohortDefinitionSet = cohortsToCreate
+  )
+  
+  cohortCounts <- CohortGenerator::getCohortCounts(
+    connectionDetails = connectionDetails,
+    cohortDatabaseSchema = "user_teele",
+    cohortTable = cohortTableNames$cohortTable
+  )
+  
+  cohortData <- merge(cohortsToCreate[, c("cohortId", "cohortName")],
+                        cohortCounts, by = "cohortId")
+  return(cohortData)
+}
+
+# ------------------ Lae või genereeri andmed ------------------
+cohortFile <- "cohortData.rds"
+if (!file.exists(cohortFile)) {
+  cohortData <- generateCohorts()
+  saveRDS(cohortData, cohortFile)
+} else {
+  cohortData <- readRDS(cohortFile)
+}
+
+cohortData <- cohortData %>% 
+  mutate(
+    indicator = tolower(stringr::str_extract(cohortName, "(?i)ind\\d+"))
+  )
+
+# Arvutame osakaalud:
+indicator_ratios <- cohortData %>%
+  group_by(indicator) %>%s
+  summarise(
+    lugeja   = sum(cohortSubjects[grepl("(?i)lugeja",   cohortName)], na.rm = TRUE),
+    nimetaja = sum(cohortSubjects[grepl("(?i)nimetaja", cohortName)], na.rm = TRUE),
+    ratio    = if (nimetaja > 0) (lugeja / nimetaja) * 100 else NA_real_,
+    .groups  = "drop"
+  )
+
+print(indicator_ratios)
+```
+
+
+```{r}
+# ------------------ Dashboard'i kood ------------------
+
+ui <- dashboardPage(
+  dashboardHeader(
+    title = "Ravikvaliteedi indikaatorid",
+    titleWidth = 300
+  ),
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Avaleht",          tabName = "avaleht",     icon = icon("home")),
+      menuItem("Emakakaelavähk",   tabName = "emakakael",   icon = icon("female")),
+      menuItem("Eesnäärmevähk",    tabName = "eesnaare",    icon = icon("male")),
+      menuItem("Rinnavähk",        tabName = "rinnav",      icon = icon("ribbon")),
+      menuItem("Kolorektaalvähk",  tabName = "kolorekt",    icon = icon("bed-pulse"))
+    )
+  ),
+  dashboardBody(
+    tags$head(
+      tags$style(HTML("
+        .small-time { font-size: 80%; }
+        .small-box   { min-height: 140px !important; }
+        .indicator-box .box {
+          border-radius: 8px !important;
+        }
+        .indicator-box .big-num {
+          font-size: 3rem !important;
+          margin-top: 10px;
+          font-weight: 300;
+        }
+      "))
+    ),
+    
+    tabItems(
+      # --- AVALEHT ---
+      tabItem(
+        tabName = "avaleht",
+        fluidRow(
+          box(
+            width = 3, status = "info", solidHeader = TRUE,
+            title = "Info",
+            "Kohordid on laetud."
+          ),
+          valueBoxOutput("totalPatientsBox", width = 3),
+          valueBoxOutput("activeCohortsBox", width = 3),
+          valueBoxOutput("lastUpdatedBox",   width = 3)
+        ),
+        fluidRow(
+          box(
+            width = 12, status = "primary", solidHeader = TRUE,
+            title = "Kohortide tabel",
+            DTOutput("cohortTable")
+          )
+        ),
+        fluidRow(
+          box(
+            width = 12, status = "primary", solidHeader = TRUE,
+            title = "Kohortide ülevaade",
+            plotOutput("patientOverview")
+          )
+        )
+      ),
+      
+      # --- EMAKAKAELAVÄHK ---
+      tabItem(
+        tabName = "emakakael",
+        h2("Emakakaelavähi indikaatorid"),
+        fluidRow(
+          # Indikaatori valik
+          box(
+            width = 3,
+            title = "Indikaatorite loetelu",
+            status = "info",
+            solidHeader = TRUE,
+            p("Vali indikaator:"),
+            actionLink("link_ind1", "1. MRT enne esmast raviotsust"),
+            br(),
+            actionLink("link_ind3", "3. Samaaegne keemiaravi kiiritusraviga"),
+            br(),
+            actionLink("link_ind4", "4. Lähikiirtusravi kasutus"),
+            br(),
+            actionLink("link_ind5", "5. Radikaalse kiiritusravi kestus kuni 56 päeva")
+          ),
+          # Paneel
+          box(
+            width = 9,
+            status = "primary",
+            solidHeader = TRUE,
+            title = textOutput("emakakael_indicator_title"),
+            uiOutput("emakakael_indicator_content"),
+            uiOutput("emakakael_indicator_details")
+          )
+        )
+      ),
+      
+      # --- Tabs ---
+      tabItem(tabName = "eesnaare", h2("Eesnäärmevähk")),
+      tabItem(tabName = "rinnav", h2("Rinnavähk")),
+      tabItem(tabName = "kolorekt", h2("Kolorektaalvähk"))
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  # --- 1) Laeme kohortide andmed ---
+  loadedCohortData <- reactive({ cohortData })
+  
+  # --- 2) Avaleht Outputs ---
+  output$cohortTable <- renderDT({
+  loadedCohortData() %>%
+    select(-indicator, -cohortEntries) %>%
+    rename(
+      'Kohordi nimi'    = cohortName,
+      'Patsientide arv' = cohortSubjects,
+      'Kohordi ID'        = cohortId
+    ) %>%
+    datatable(
+      rownames = FALSE,
+      options = list(
+        pageLength = 10,
+        language   = list(
+          search      = "Otsing:",
+          lengthMenu  = "Näita _MENU_ rida",
+          info        = "Näitan ridu _START_–_END_ kokku _TOTAL_",
+          zeroRecords = "Kirjeid ei leitud",
+          paginate    = list(
+            first    = "Esimene",
+            previous = "Eelmine",
+            'next'     = "Järgmine",
+            last     = "Viimane"
+          )
+        )
+      )
+    )
+})
+
+
+  
+  
+  
+  
+  
+  output$patientOverview <- renderPlot({
+    ggplot(loadedCohortData(), aes(x = factor(cohortId), y = cohortSubjects)) +
+      geom_bar(stat = "identity", fill = "skyblue") +
+      theme_minimal() +
+      labs(x = "Kohordi ID", y = "Patsientide arv", title = "Kõigi patsientide ülevaade")
+  })
+  
+  output$totalPatientsBox <- renderValueBox({
+    n_pat <- length(unique(fetch_dashboard_simple()$subject_id))
+    valueBox(n_pat,
+             "Patsientide arv",
+             icon = icon("user"),
+             color = "blue")
+  })
+  
+  
+  output$activeCohortsBox <- renderValueBox({
+    valueBox(
+      nrow(loadedCohortData()),
+      "Kohorte kokku",
+      icon = icon("users"),
+      color = "green"
+    )
+  })
+  
+  output$lastUpdatedBox <- renderValueBox({
+    ts <- Sys.time()
+    valueBox(
+    # 1) aeg ja kuupäev
+      tagList(
+        div(format(ts, "%H:%M:%S")),                    
+        div(class = "small-time", format(ts, "%Y/%m/%d")) 
+      ),                                                  
+      "Viimati uuendatud",                                # subtitle
+      icon  = icon("clock"),
+      color = "purple"
+    )
+  })
+
+
+
+  # --- 3) Emakakaela indikaatori paneel ---
+  # reactive value
+  selectedIndicator <- reactiveVal(NULL)
+  
+  observeEvent(input$link_ind1, { selectedIndicator("ind1") })
+  observeEvent(input$link_ind3, { selectedIndicator("ind3") })
+  observeEvent(input$link_ind4, { selectedIndicator("ind4") })
+  observeEvent(input$link_ind5, { selectedIndicator("ind5") })
+  
+  output$emakakael_indicator_title <- renderText({
+    req(selectedIndicator())
+    switch(
+      selectedIndicator(),
+      "ind1"    = "1. Esmase emakakaelavähi diagnoosimisel vaagnast MRT teostamise osakaal kõigist esmastest patsientidest",
+      "ind3"    = "3. Emakakaelavähi radikaalse kiiritusraviga samaaegne keemiaravi kasutamine",
+      "ind4" = "4. Lähikiirtusravi kasutus emakakaelavähi radikaalse kiiritusravi korral",
+      "ind5" = "5. Emakakaelavähi radikaalse kiiritusravi kestus kuni 56 päeva",
+      "Vali indikaator"
+    )
+  })
+  
+  output$emakakael_indicator_content <- renderUI({
+    req(selectedIndicator())
+    if(selectedIndicator() == "ind1"){
+      tagList(
+        p("Esmase emakakaelavähi diagnoosiga patsientide osakaal, kellele on tehtud MRT vaagnast enne esmast raviotsust (või konsiiliumi puudumisel enne esmast onkoloogilist ravi)."),
+        actionLink("info_ind1", label = tagList(icon("info-circle"), " Rohkem infot"))
+      )
+    } else if(selectedIndicator() == "ind3"){
+      tagList(
+        p("Esmaselt kiiritusraviga ravitud emakakaelavähi diagnoosiga patsientide osakaal, kellele on samaaegselt kiiritusraviga ordineeritud keemiaravi kõigist radikaalsel eesmärgil kiiritusravi saanutest."),
+        actionLink("info_ind3", label = tagList(icon("info-circle"), " Rohkem infot"))
+      )
+    } else if(selectedIndicator() == "ekv_ind4"){
+      tagList(
+        p("Esmaselt radikaalsel eesmärgil ravitud emakakaelavähi diagnoosiga patsientide osakaal, kelle kiiritusravis on ühe ravikompleksuse osana kasutatud emakaõõnesisest lähikiiritusravi."),
+        actionLink("info_ind4", label = tagList(icon("info-circle"), " Rohkem infot"))
+      )
+    } else if(selectedIndicator() == "ekv_ind5"){
+      tagList(
+        p("Radikaalset kiiritusravi saavate esmaste emakakaelavähi diagnoosiga patsientide osakaal, kelle ravi ei kesta üle 56 päeva, kõigist sama grupi patsientidest."),
+        actionLink("info_ind5", label = tagList(icon("info-circle"), " Rohkem infot"))
+      )
+    }
+  })
+  
+  # Üleüldine osakaal, radio buttons, plot
+  output$emakakael_indicator_details <- renderUI({
+    req(selectedIndicator())
+    # Üldine osakaal arvutus
+    overall_value <- {
+      df <- loadedCohortData() %>%
+        filter(indicator == selectedIndicator()) %>%
+        summarise(
+          total_lugeja = sum(if_else(
+            grepl("(?i)lugeja", cohortName), cohortSubjects, 0
+          ), na.rm = TRUE),
+          total_nimetaja = sum(if_else(
+            grepl("(?i)nimetaja", cohortName), cohortSubjects, 0
+          ), na.rm = TRUE)
+        )
+      if (df$total_nimetaja != 0)
+        (df$total_lugeja / df$total_nimetaja) * 100
+      else
+        NA_real_
+    }
+    tagList(
+      # numbrikast
+      valueBox(
+        value    = tagList(
+          h1(paste0(round(overall_value, 1), "%"),
+             style = "font-size:4rem; margin:0; font-weight:700;")
+        ),
+        subtitle = "Patsientide osakaal",
+        icon     = icon("percent", style = "position: relative; top: -10px;"),
+        color    = "aqua",
+        width    = 6
+      ),
+      # radio buttons + plot
+      br(),
+      radioButtons(
+        "plotMode",
+        "Näita diagrammi:",
+        choices = c(
+          "Aasta" = "year",
+          "Terviseteenuse osutaja" = "provider",
+          "Aasta ja osutaja"       = "year_provider"
+        ),
+        inline = TRUE
+      ),
+      plotlyOutput("indPlot", height = "450px", width = "100%")
+    )
+  })
+
+  
+  # --- 4) Agregeeritud andmed (Reactives) ---
+  # Yearly summary
+  yearly_summary   <- reactive(make_summaries(fetch_dashboard_simple(),   by_year = TRUE,  by_provider = FALSE))
+  
+  # Provider summary
+  provider_summary <- reactive(make_summaries(fetch_dashboard_provider(), by_year = FALSE, by_provider = TRUE))
+  
+  # Year + Provider summary
+  yearprov_summary <- reactive(make_summaries(fetch_dashboard_provider(), by_year = TRUE,  by_provider = TRUE))
+  
+  # --- 5) Render Interactive Plot ---
+  output$indPlot <- renderPlotly({
+  req(selectedIndicator())
+  mode <- input$plotMode %||% "year"
+  
+  # 1) agregeeritud tabelid
+  df <- switch(
+    mode,
+    year          = yearly_summary(),
+    provider      = provider_summary(),
+    year_provider = yearprov_summary()
+  ) %>% filter(indicator == selectedIndicator())
+  
+  # 2) ggplot
+  if (mode == "year") {
+    p <- ggplot(df, aes(x = factor(year))) +
+      geom_col(aes(y = 100),
+               fill = "gray80", color = "black") +
+      geom_col(aes(y = ratio),
+               fill = "#1f78b4") +
+      scale_y_continuous(limits = c(0, 100),
+                         labels = scales::percent_format(scale = 1)) +
+      labs(x = "Aasta", y = "Osakaal (%)",
+           title = paste("Indikaatori väärtus aastate kaupa")) +
+      theme_minimal(base_size = 14)
+    
+  } else if (mode == "provider") {
+    p <- ggplot(df, aes(x = provider)) +
+      # 1) hall taust
+      geom_col(aes(y = 100),
+               fill  = "gray80",
+               color = "black") +
+      # 2) värvilised osakaalud
+      geom_col(aes(y = ratio),
+               fill = "#1f78b4") +
+      scale_y_continuous(limits = c(0, 100),
+                         labels = scales::percent_format(scale = 1)) +
+      scale_x_discrete(
+        labels = function(x)
+          stringr::str_wrap(x, width = 12)
+      ) +
+      labs(x     = "Osutaja",
+           y     = "Osakaal (%)",
+           title = "Indikaatori väärtus osutajate kaupa") +
+      theme_minimal(base_size = 14) +
+      theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+            plot.margin  = margin(5, 15, 5, 5))
+
+    
+  } else {
+    p <- ggplot(df, aes(x = factor(year), group = provider)) +
+      geom_col(aes(y = 100),
+               fill = "gray80", color = "black",
+               width = 0.7,
+               position = position_dodge2(width = 0.8, padding = 0.4)) +
+      geom_col(aes(y = ratio, fill = provider),
+               width = 0.7,
+               position = position_dodge2(width = 0.9, padding = 0.4)) +
+      scale_y_continuous(limits = c(0, 100),
+                         labels = scales::percent_format(scale = 1)) +
+      scale_fill_manual(
+        values = c(
+          "Põhja-Eesti Regionaalhaigla SA" = "#34495e",
+          "Tartu Ülikooli Kliinikum SA"    = "#16a085",
+          "Ida-Tallinna Keskhaigla AS"     = "#f39c12"
+        ),
+        name = "Osutaja"
+      ) +
+      labs(x = "Aasta", y = "Osakaal (%)",
+           title = paste("Indikaatori väärtus aastate ja osutajate kaupa")) +
+      theme_minimal(base_size = 14) +
+      theme_minimal(base_size = 14) +
+      theme(
+        axis.text.x     = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom",
+        legend.title    = element_blank(),
+        legend.text     = element_text(size = 8),
+        plot.margin     = margin(t = 15, r = 15, b = 40, l = 60)
+      )
+  }
+  
+  # 3) plotly-sse
+  ggplotly(p) %>%
+    layout(margin = list(l = 60, r = 30, b = 60, t = 60),
+           legend = list(
+      orientation = "h",
+      x           = 0.5,
+      xanchor     = "center",
+      y           = -0.2
+    ))
+})
+  
+  
+  # --- 6) "Rohkem infot" ---
+  observeEvent(input$info_ind1, {
+    showModal(modalDialog(
+      title = "Lisainfo",
+      "MRT
+on parim kuvastusmeetod hindamaks pehmeid kudesid ja seega k a
+mitteinvasiivselt emakakaelavähi lokaalset levikut vaagnas, st kasvaja
+suurust, levikut parameetriumitesse, naaberorganitesse, l/s haaratust.
+MRT annab olulist lisainformatsiooni palpatoorsele leiule, MRT on
+oluliselt täpsem kasvaja leviku hindamisel vaag nas v õ rreldes KTga.
+MRT abil viib miinimumini ebavajalike lisauuringute teostamise ja
+ebaefektiivsete ravimeetodite kasutamise, mis p õ hjustavad
+mittevajalikke kannatusi patsiendile ja ebavajalikke kulutusi
+meditsiinisü steemile. MRT on üks oluliseimaid m eetodeid raviviisi
+valiku tegemisel kirurgia vs radiokemoteraapia.
+Arvestades
+MRT suhteliselt head kättesaadavust Eestis, peaks see
+olema standardmeetod emakakaelavähi lokaalse leviku hindamiseks
+cIA2 IVb haiguse leviku korral.",
+      easyClose = TRUE
+    ))
+  })
+  
+  observeEvent(input$info_ind3, {
+    showModal(modalDialog(
+      title = "Lisainfo",
+      "Radikaalse kiiritusravi korral on näidustatud samaaegne plaatinapõhine keemiaravi, kui ei ole vastunäidustusi keemiaravi kasutamisele. Radiokemoteraapia on NCCN ravijuhiste järgi esmane ravivalik Ib2, IIA2 , IIB-IVa staadiumis emakakaelavähi korral.
+Mitmed randomiseeritud uuringud ja meta-analüüsid on näidanud, et keemiaravi samaaegne lisamine kiiritusravile, parandab progressioonivaba elulemus, vähendab surma riski 30-50%, parandab 5aasta elulemust ca 6% võrreldes ainult kiiritusravi kasutamisega.",
+      easyClose = TRUE
+    ))
+  })
+  
+  observeEvent(input$info_ind4, {
+    showModal(modalDialog(
+      title = "Lisainfo",
+      "Radiokemoteraapia on NCCN ravijuhendite järgi esmane ravivalik Ib2, IIA2, IIB-IVa staadiumis emakakaelavähi korral. Eesmärgiks on tervendav ravi.
+Kasvaja ravivastus kiiritusravile sõltub kiiritusravi doosist. Tervendaval eesmärgil tehtud ravidoos peab olema optimaalne nii tuumorikoe kui normaalsete organite suhtes.. Rahvusvaheliselt aktsepteeritud kiiritusravi doos tuumorile (punkt A või HR-CTVD90) on 2 Gy ekvivalendis arvutatuna vähemalt 80-85 Gy, et saavutada enamikul patsientidest täielik ravivastus.
+Täielik ravivastus on kasvaja lokaalse kontrolli aluseks. On tõestatud, et lokaalne kontroll emakakaelavähi korral mõjutab üldist elulemust. Lähikiiritusravi on seni teadaolevalt võtmekomponent saavutamaks nimetatud ravidoose. Mitte ühegi seni laialt kasutatava väliskiiritusravi meetodiga (konventsionaalne, 3Dkonformne, IMRT, VMAT) ei ole võimalik saavutada 80-85 Gy doosi kasvajale seadmata liigselt ohtu normaalseid vaagnaorganeid.
+Indikaator näitab kiiritusravi keskuse tehnilist ja inimressursi võimekust pakkuda radikaalse emakakaelavähi kiiritusravi ühe osana emakaõõnesisest lähikiiritusravi. See võimekus on eelduseks rahvusvahelistest ravijuhenditest kinnipidamisel. Emakakaelavähi radikaalset kiiritusravi saavad pakkuda vaid keskused, kus on võimalus kasutada rutiinselt emakaõõnesisest lähikiiritusravi.",
+      easyClose = TRUE
+    ))
+  })
+  
+  observeEvent(input$info_ind5, {
+    showModal(modalDialog(
+      title = "Lisainfo",
+      "Radikaalse kiiritusravi kestus peab jääma 56 päeva piiresse.
+On teada, et raviaja pikenemine seostub lokaalse kontrolli vähenemisega. Üldine raviaeg peab olema nii lühike kui võimalik, kiiritusravi emakakaelavähi korral peab jääma 56 päeva sisse. Ravivaheajad põhjustavad kasvaja repopulatsiooni ja halvendavad ravivastust.
+Indikaator näitab organiseeritust osakonnasiseselt vältimaks ravipause tehnilistel, organisatoorsetel põhjustel, ravimodaliteetide vahelisel ajal, samuti piisava toetusravi olemasolu ravi kestel, et vältida üldseisundi tõttu vajatavaid ravipause. Ravi kestus on seoses lokoregionaalse kontrolliga, mis on omakorda seoses elulemusega.",
+      easyClose = TRUE
+    ))
+  })
+  
+}
+
+shinyApp(ui, server)
+```
