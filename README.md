@@ -66,3 +66,6 @@ Edaspidine käivitamine loeb andmed cohortData.rds failist ja on kiirem.
 ```bash
 git clone https://github.com/sinu_kasutajanimi/ravikvaliteedi-dashboard.git
 cd ravikvaliteedi-dashboard
+```
+
+Koodi kirjutamisel ja kohendamisel on kasutatud ka tehisintellektil põhineva OpenAI keelemudeli ChatGPT o3 abi.
